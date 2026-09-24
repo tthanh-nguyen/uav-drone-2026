@@ -9,10 +9,11 @@ from collections import deque
 import numpy as np
 from geometry import CameraExtrinsic, marker_yaw_enu
 from transform import quat_to_rotmat
+from std_msgs.msg import Bool, Float32
 import time,math
 from sensor_msgs.msg import Image, Imu
 from px4_msgs.msg import VehicleOdometry
-from aruco_msgs.msg import MarkerLocalizerHealth
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 
 def stamp_to_sec_odom(stamp):
     # return stamp.sec + stamp.nanosec*1e-9
@@ -38,12 +39,15 @@ class MarkerLocalizer(Node):
 
         self.pub_rel = self.create_publisher(PointStamped, "/marker_rel", qos)
         self.pub_pose = self.create_publisher(PoseStamped, "/marker_pose", qos)
-
+        self.pub_height = self.create_publisher(Float32, "~/height", qos)
+        self.pub_valid = self.create_publisher(Bool, "~/valid", qos)
+        self.create_timer(self.marker_timeout / 2.0, self._check_marker_fresh)
         self.declare_parameter("buffer-s",2.0)
 
 
         
         self._attitude = deque()
+        self._last_marker = None
 
         self.declare_parameter("mount_roll_deg", 0.0)
         self.declare_parameter("mount_pitch_deg", 0.0)
@@ -69,28 +73,17 @@ class MarkerLocalizer(Node):
                                           mount_yaw = float(p("mount_yaw_deg").value),offset=offset)
 
 
-        self.last_odom_time = None
-        self.last_marker_pose_time = None
-        self.last_rel_publish_time = None
-        self.last_pose_publish_time = None
+       
 
-        self.last_time_sync_error = None
-        self.last_transform_time = None
+        
 
-        self.health_timer = self.create_timer(1.0,self.health_check)
+        
+        self.max_attitude_age = float(self.get_parameter("max_attitude_age_s").value)
 
-        self.odom_timeout = 1.0
-        self.marker_pose_timeout = 1.0
-        self.output_timeout = 1.0
-        self.max_attitude_age = float(
-            self.get_parameter("max_attitude_age_s").value
-        )
-        self.health_timer = self.create_timer(
-                    1.0,
-                    self.health_check
-                )
-        self.pub_health = self.create_publisher(MarkerLocalizerHealth,"/drone/marker_localizer_health",10)
-   
+
+        self.health_timer = self.create_timer(1.0, self.health_check)
+        self.create_timer(self.marker_timeout / 2.0, self._check_marker_fresh)
+        self.pub_health = self.create_publisher(DiagnosticArray,"/diagnostics",10)
     def on_mavros_pose(self,msg):
         # cais nayf dunfg gps
         q = msg.pose.orientation
@@ -141,8 +134,9 @@ class MarkerLocalizer(Node):
 
         p_body_ned = (self.extrinsic.R_ned_from_cam @ p_cam + self.extrinsic.offset)
         R_enu_from_ned = quat_to_rotmat(*q_xyzw)
-        print("p_body_flu", p_body_ned)
+        
         p_rel = R_enu_from_ned @ p_body_ned
+        self._last_marker = time.monotonic()
         # p_rel = p_body_ned
         self.last_transform_time = time.monotonic()
         header_level = msg.header
@@ -170,6 +164,9 @@ class MarkerLocalizer(Node):
         self.last_pose_publish_time = time.monotonic()
 
         # p_rel[2] am khi marker o duoi drone -> doi dau thanh do cao duong
+
+        self.pub_height.publish(Float32(data=float(-p_rel[2])))
+        self.pub_valid.publish(Bool(data=True))
     def health_check(self):
 
         now = time.monotonic()
@@ -308,35 +305,94 @@ class MarkerLocalizer(Node):
         # 8. PUBLISH HEALTH
         # ==========================================
 
-        health = MarkerLocalizerHealth()
+        diagnostic = DiagnosticArray()
+        diagnostic.header.stamp = self.get_clock().now().to_msg()
 
-        health.odometry_ok = odometry_ok
-        health.marker_pose_ok = marker_pose_ok
-        health.time_sync_ok = time_sync_ok
-        health.transform_ok = transform_ok
-        health.output_ok = output_ok
+        status_msg = DiagnosticStatus()
 
-        health.marker_available = marker_available
+        status_msg.name = "Marker Localizer"
+        status_msg.level = level
+        status_msg.message = status
 
-        if np.isfinite(odometry_age):
-            health.odometry_age = float(odometry_age)
-        else:
-            health.odometry_age = -1.0
+        status_msg.values.append(
+            KeyValue(
+                key="Odometry",
+                value=str(odometry_ok)
+            )
+        )
 
-        if np.isfinite(marker_pose_age):
-            health.marker_pose_age = float(marker_pose_age)
-        else:
-            health.marker_pose_age = -1.0
+        status_msg.values.append(
+            KeyValue(
+                key="Marker Pose",
+                value=str(marker_pose_ok)
+            )
+        )
 
-        if np.isfinite(time_sync_error):
-            health.time_sync_error = float(time_sync_error)
-        else:
-            health.time_sync_error = -1.0
+        status_msg.values.append(
+            KeyValue(
+                key="Time Sync",
+                value=str(time_sync_ok)
+            )
+        )
 
-        health.level = level
-        health.status = status
+        status_msg.values.append(
+            KeyValue(
+                key="Transform",
+                value=str(transform_ok)
+            )
+        )
 
-        self.pub_health.publish(health)
+        status_msg.values.append(
+            KeyValue(
+                key="Output",
+                value=str(output_ok)
+            )
+        )
+
+        status_msg.values.append(
+            KeyValue(
+                key="Marker Available",
+                value=str(marker_available)
+            )
+        )
+
+        status_msg.values.append(
+            KeyValue(
+                key="Odometry Age",
+                value=f"{odometry_age:.3f}"
+            )
+        )
+
+        status_msg.values.append(
+            KeyValue(
+                key="Marker Pose Age",
+                value=f"{marker_pose_age:.3f}"
+            )
+        )
+
+        status_msg.values.append(
+            KeyValue(
+                key="Time Sync Error",
+                value=f"{time_sync_error:.3f}"
+            )
+        )
+
+        diagnostic.status.append(status_msg)
+
+        self.pub_health.publish(diagnostic)
+
+    def _check_marker_fresh(self):
+        """Khong co pose moi trong marker_timeout -> bao mat marker.
+        ~/valid=False co HAI nguyen nhan khac han nhau, va bo dieu khien phai
+        xu ly khac nhau: mat marker (khuat tam nhin, thuong tam thoi) va mat
+        attitude (MAVROS co van de, nghiem trong hon nhieu).
+        """
+        if self._last_marker is None:
+            return
+        if time.monotonic() - self._last_marker > self.marker_timeout:
+            self.pub_valid.publish(Bool(data=False))
+            self.get_logger().warn("Mat marker", throttle_duration_sec=2.0)
+
 def main(args=None):
     rclpy.init(args=args)
     brake = MarkerLocalizer()

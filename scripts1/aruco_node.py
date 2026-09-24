@@ -26,6 +26,7 @@ from transform import rotmat_to_quat
 from geometry import CameraExtrinsic
 from aruco_msgs.msg import ArucoHealth
 import visualization as viz
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 
 try:
     from cv_bridge import CvBridge
@@ -109,6 +110,7 @@ class ArucoPoseNode(Node):
         self.n_detected = 0
         self._last_cb = None
         self._fps = 0.0
+        self.last_detect_ms = 0.0
         self.lastest_frame = None
         self.frame_lock = threading.Lock()
         self.new_frame_event = threading.Event()
@@ -151,11 +153,73 @@ class ArucoPoseNode(Node):
         
         self.pub_poststamp = self.create_publisher(PoseStamped,"/posestamp_camOfThanh",qos)
         self.check_cam = None
-        self.pub_health = self.create_publisher(ArucoHealth,"/drone/aruco_health",10)
+        self.create_timer(1.0,self.health_check)
+        # self.pub_health = self.create_publisher(ArucoHealth,"/drone/aruco_health",10)
         # self.create_timer(1.0/30.0,self.on_time)
+        self.pub_health = self.create_publisher(DiagnosticArray,"/diagnostics",10)
 
 
+    def health_check(self):
 
+        msg = DiagnosticArray()
+        msg.header.stamp = self.get_clock().now().to_msg()
+
+        status = DiagnosticStatus()
+        status.name = "ArUco Marker Localizer"
+
+        # -------------------------
+        # 1. Camera
+        # -------------------------
+        if self.lastest_frame is None:
+            status.level = DiagnosticStatus.ERROR
+            status.message = "No camera frame"
+        else:
+            status.level = DiagnosticStatus.OK
+            status.message = "ArUco system OK"
+
+        # -------------------------
+        # 2. FPS
+        # -------------------------
+        status.values.append(
+            KeyValue(
+                key="FPS",
+                value=f"{self._fps:.2f}"
+            )
+        )
+
+        # -------------------------
+        # 3. Detection latency
+        # -------------------------
+        status.values.append(
+            KeyValue(
+                key="Detection latency",
+                value=f"{self.last_detect_ms:.2f} ms"
+            )
+        )
+
+        # -------------------------
+        # 4. Frames
+        # -------------------------
+        status.values.append(
+            KeyValue(
+                key="Frames received",
+                value=str(self.n_frame)
+            )
+        )
+
+        # -------------------------
+        # 5. Markers detected
+        # -------------------------
+        status.values.append(
+            KeyValue(
+                key="Markers detected",
+                value=str(self.n_detected)
+            )
+        )
+
+        msg.status.append(status)
+
+        self.pub_health.publish(msg)
 
    
 
@@ -272,6 +336,7 @@ class ArucoPoseNode(Node):
                                 
         self.pub_poststamp.publish(msg) 
         self.last_pose_time = time.monotonic()
+
     def get_image(self, msg):
 
         try:
